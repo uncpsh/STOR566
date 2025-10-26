@@ -1,0 +1,91 @@
+# ======== STOR566: Sijin run (AlexNet, CIFAR-10, 2 epochs) ========
+# 0) Setup
+!pip -q install timm
+!git clone -q https://github.com/ziplab/LITv2.git
+
+import os, time, random
+import numpy as np
+import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision, torchvision.transforms as T
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import pandas as pd
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import sys; sys.path.append('/content/LITv2')
+from hilo import HiLo  # (not used in this block)
+
+def set_seed(seed=2025):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+set_seed(2025)
+
+def get_cifar_loaders(img_size=32, batch_size=128, num_workers=2):
+    norm = T.Normalize((0.4914,0.4822,0.4465),(0.2470,0.2435,0.2616))
+    train_tf = T.Compose([T.RandomCrop(img_size, padding=4), T.RandomHorizontalFlip(), T.ToTensor(), norm])
+    test_tf  = T.Compose([T.ToTensor(), norm])
+    train_ds = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=train_tf)
+    test_ds  = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=test_tf)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return train_loader, test_loader, 10
+
+class AlexNet32(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64,192,3,1,1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(192,384,3,1,1), nn.ReLU(),
+            nn.Conv2d(384,256,3,1,1), nn.ReLU(),
+            nn.Conv2d(256,256,3,1,1), nn.ReLU(), nn.MaxPool2d(2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5), nn.Linear(256*4*4, 4096), nn.ReLU(),
+            nn.Dropout(0.5), nn.Linear(4096, 4096), nn.ReLU(),
+            nn.Linear(4096, num_classes)
+        )
+    def forward(self, x):
+        x = self.features(x); x = torch.flatten(x,1); return self.classifier(x)
+
+@torch.no_grad()
+def eval_model(model, loader, criterion):
+    model.eval(); total=0; correct=0; loss_sum=0.0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        with autocast(True):
+            logits = model(x); loss = criterion(logits,y)
+        pred = logits.argmax(1)
+        correct += (pred==y).sum().item()
+        total += y.size(0); loss_sum += loss.item()*y.size(0)
+    return {'loss': loss_sum/total, 'top1': 100.0*correct/total}
+
+def train_one(model, train_loader, test_loader, epochs=2, lr=3e-4, wd=1e-4, outdir='./exp_outputs_Sijin'):
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = GradScaler(True); crit = nn.CrossEntropyLoss().to(device)
+    hist=[]
+    for ep in range(1, epochs+1):
+        model.train(); run=0.0; n=0
+        for x,y in train_loader:
+            x,y = x.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            with autocast(True):
+                logits = model(x); loss = crit(logits,y)
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            run += loss.item()*y.size(0); n += y.size(0)
+        sched.step()
+        ev = eval_model(model, test_loader, crit)
+        row={'epoch':ep,'train_loss':run/n,'test_loss':ev['loss'],'test_top1':ev['top1'],'lr':sched.get_last_lr()[0]}
+        hist.append(row); print(f"[alexnet] Epoch {ep:02d}  top1={row['test_top1']:.2f}%  loss={row['test_loss']:.4f}")
+    df = pd.DataFrame(hist); os.makedirs(outdir, exist_ok=True)
+    df.to_csv(os.path.join(outdir,'history_cifar10_alexnet.csv'), index=False)
+    pd.DataFrame([{'model':'alexnet','best_top1':df['test_top1'].max()}]).to_csv(
+        os.path.join(outdir,'summary_cifar10_Sijin.csv'), index=False)
+    print("\nSaved:", os.path.join(outdir,'summary_cifar10_Sijin.csv'))
+
+# Go!
+train_loader, test_loader, ncls = get_cifar_loaders()
+model = AlexNet32(ncls)
+train_one(model, train_loader, test_loader, epochs=2, lr=3e-4, wd=1e-4, outdir='./exp_outputs_Sijin')
