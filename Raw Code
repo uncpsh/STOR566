@@ -1,0 +1,409 @@
+# =========================
+# STOR566 - HiLo vs CNNs on CIFAR-10/100 (Colab-ready)
+# =========================
+# Features:
+# - Datasets: CIFAR-10 / CIFAR-100
+# - Models: LogisticRegression, LeNet, AlexNet(32x32), ResNet18, HiLoViT (using LITv2 HiLo)
+# - Metrics: Top-1/Top-5, params, FLOPs, train time/epoch, inference latency, throughput (img/s), peak GPU mem
+# - Training: AMP, Cosine LR, LabelSmoothingCE, simple early-stop option
+# - Logging: TensorBoard (optional), CSV summary, PNG learning curves
+# - Reproducibility: fixed seed
+# -------------------------
+!pip -q install timm torchinfo thop tensorboard
+!git clone -q https://github.com/ziplab/LITv2.git
+import sys, os, time, math, json, random
+import numpy as np
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as T
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
+
+from torchinfo import summary as torchinfo_summary
+from thop import profile
+
+# Make LITv2 importable for HiLo
+sys.path.append('/content/LITv2')
+from hilo import HiLo  # official module
+
+# -------------------------
+# Reproducibility
+# -------------------------
+def set_seed(seed=2025):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False  # for speed keep False
+    torch.backends.cudnn.benchmark = True
+
+set_seed(2025)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# -------------------------
+# Data: CIFAR-10 / CIFAR-100
+# -------------------------
+def get_cifar_loaders(dataset='cifar10', img_size=32, batch_size=128, num_workers=2, aug='standard'):
+    normalize = T.Normalize(mean=(0.4914,0.4822,0.4465), std=(0.2470,0.2435,0.2616))
+    if dataset.lower() == 'cifar100':
+        num_classes = 100
+        train_set_fn = torchvision.datasets.CIFAR100
+        test_set_fn  = torchvision.datasets.CIFAR100
+    else:
+        num_classes = 10
+        train_set_fn = torchvision.datasets.CIFAR10
+        test_set_fn  = torchvision.datasets.CIFAR10
+
+    if aug == 'strong':
+        train_tf = T.Compose([
+            T.RandomCrop(img_size, padding=4),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(0.4,0.4,0.4,0.1),
+            T.RandomGrayscale(p=0.1),
+            T.ToTensor(), normalize
+        ])
+    else:  # standard
+        train_tf = T.Compose([
+            T.RandomCrop(img_size, padding=4),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(), normalize
+        ])
+    test_tf = T.Compose([T.ToTensor(), normalize])
+
+    train_ds = train_set_fn(root='./data', train=True, download=True, transform=train_tf)
+    test_ds  = test_set_fn(root='./data', train=False, download=True, transform=test_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return train_loader, test_loader, num_classes
+
+# -------------------------
+# Models: Logistic / LeNet / AlexNet(32x32) / ResNet18 / HiLoViT
+# -------------------------
+class LogisticRegressionNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.fc = nn.Linear(32*32*3, num_classes)
+    def forward(self, x):
+        return self.fc(x.view(x.size(0), -1))
+
+class LeNetSmall(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 6, 5, padding=2), nn.ReLU(), nn.AvgPool2d(2),
+            nn.Conv2d(6, 16, 5), nn.ReLU(), nn.AvgPool2d(2)
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(16*6*6, 120), nn.ReLU(),
+            nn.Linear(120, 84), nn.ReLU(),
+            nn.Linear(84, num_classes)
+        )
+    def forward(self, x): return self.fc(self.conv(x))
+
+class AlexNet32(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 192, kernel_size=3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(192, 384, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(384, 256, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(256*4*4, 4096), nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(4096, 4096), nn.ReLU(),
+            nn.Linear(4096, num_classes)
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+def get_resnet18(num_classes=10):
+    m = torchvision.models.resnet18(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, num_classes)
+    return m
+
+# ---- HiLoViT for CIFAR (tiny ViT with HiLo blocks) ----
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_ch=3, embed_dim=192):
+        super().__init__()
+        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.grid = img_size // patch_size
+    def forward(self, x):
+        x = self.proj(x)                      # B, C, H', W'
+        x = x.flatten(2).transpose(1, 2)      # B, N, C
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, dim, mlp_ratio=4.0, drop=0.0):
+        super().__init__()
+        hidden = int(dim*mlp_ratio)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(drop)
+        self.act  = nn.GELU()
+    def forward(self, x):
+        x = self.fc1(x); x = self.act(x); x = self.drop(x)
+        x = self.fc2(x); x = self.drop(x)
+        return x
+
+class HiLoBlock(nn.Module):
+    def __init__(self, dim, num_heads=6, window_size=2, alpha=0.5, drop=0.0, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn  = HiLo(dim=dim, num_heads=num_heads, window_size=window_size, alpha=alpha)
+        self.drop_path = nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp   = MLP(dim, mlp_ratio=mlp_ratio, drop=drop)
+    def forward(self, x, H, W):
+        # x: B,N,C
+        x = x + self.drop_path(self.attn(self.norm1(x), H, W))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+class HiLoViT(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_ch=3, num_classes=10,
+                 embed_dim=192, depth=6, num_heads=6, window_size=2, alpha=0.5):
+        super().__init__()
+        self.patch = PatchEmbed(img_size, patch_size, in_ch, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1,1,embed_dim))
+        self.pos = nn.Parameter(torch.zeros(1, (img_size//patch_size)**2 + 1, embed_dim))
+        self.blocks = nn.ModuleList([
+            HiLoBlock(embed_dim, num_heads=num_heads, window_size=window_size, alpha=alpha)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+        self.grid = img_size//patch_size
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+    def forward(self, x):
+        B = x.size(0)
+        x = self.patch(x)                         # B, N, C
+        cls = self.cls_token.expand(B, -1, -1)    # B,1,C
+        x = torch.cat([cls, x], dim=1) + self.pos # B, N+1, C
+        for blk in self.blocks:
+            x = blk(x, self.grid, self.grid)
+        x = self.norm(x)
+        cls = x[:,0]
+        return self.head(cls)
+
+# -------------------------
+# Utils: metrics, FLOPs, params, timing
+# -------------------------
+@torch.no_grad()
+def eval_model(model, loader, criterion, num_classes, measure_latency=True):
+    model.eval()
+    total, top1, top5, loss_sum = 0, 0, 0, 0.0
+    times = []
+    for images, targets in loader:
+        images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+        if measure_latency:
+            torch.cuda.synchronize() if device.type=='cuda' else None
+            t0 = time.time()
+        with autocast(enabled=True):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+        if measure_latency:
+            torch.cuda.synchronize() if device.type=='cuda' else None
+            times.append(time.time()-t0)
+        # Top-k
+        _, pred1 = outputs.topk(1, dim=1)
+        top1 += (pred1.squeeze(1)==targets).sum().item()
+        if num_classes>=5:
+            _, pred5 = outputs.topk(5, dim=1)
+            match5 = (pred5==targets.view(-1,1)).any(dim=1).sum().item()
+            top5 += match5
+        total += targets.size(0)
+        loss_sum += loss.item()*targets.size(0)
+    avg_time = np.mean(times) if times else float('nan')
+    throughput = loader.batch_size/avg_time if avg_time>0 else float('nan')
+    res = {
+        'loss': loss_sum/total,
+        'top1': top1/total*100.0,
+        'top5': (top5/total*100.0) if num_classes>=5 else None,
+        'avg_batch_latency_s': avg_time,
+        'throughput_img_per_s': throughput
+    }
+    return res
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+def get_flops(model, input_size=(1,3,32,32)):
+    model_dummy = model.to('cpu').eval()
+    x = torch.randn(*input_size)
+    flops, params = profile(model_dummy, inputs=(x,), verbose=False)
+    return int(flops), int(params)
+
+# -------------------------
+# Train loop
+# -------------------------
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, eps=0.1):
+        super().__init__()
+        self.eps = eps
+    def forward(self, logits, target):
+        n = logits.size(-1)
+        logp = F.log_softmax(logits, dim=-1)
+        loss = F.nll_loss(logp, target, reduction='mean')
+        smooth = -logp.mean(dim=-1).mean()
+        return (1-self.eps)*loss + self.eps*smooth
+
+def train_one(model, train_loader, test_loader, epochs=10, lr=1e-3, weight_decay=1e-4,
+              mix_precision=True, num_classes=10, logdir='./runs', model_name='model'):
+    model = model.to(device)
+    scaler = GradScaler(enabled=mix_precision)
+    criterion = LabelSmoothingCE(0.1).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    os.makedirs(logdir, exist_ok=True)
+
+    # FLOPs/params (cpu-only to avoid OOM)
+    try:
+        flops, params_thop = get_flops(model, input_size=(1,3,32,32))
+    except Exception:
+        flops, params_thop = -1, -1
+    params = count_params(model)
+
+    history = []
+    best_top1 = 0.0
+    t0 = time.time()
+    for ep in range(1, epochs+1):
+        model.train()
+        ep_loss, ep_total = 0.0, 0
+        if device.type=='cuda':
+            torch.cuda.reset_peak_memory_stats()
+        t_ep0 = time.time()
+        for images, targets in train_loader:
+            images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=mix_precision):
+                logits = model(images)
+                loss = criterion(logits, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            ep_loss += loss.item()*targets.size(0)
+            ep_total += targets.size(0)
+        scheduler.step()
+        train_time = time.time()-t_ep0
+        peak_mem = (torch.cuda.max_memory_allocated()/1024**2) if device.type=='cuda' else float('nan')
+
+        # Eval
+        eval_res = eval_model(model, test_loader, nn.CrossEntropyLoss().to(device), num_classes)
+        best_top1 = max(best_top1, eval_res['top1'])
+        record = {
+            'epoch': ep,
+            'train_loss': ep_loss/ep_total,
+            'test_loss': eval_res['loss'],
+            'test_top1': eval_res['top1'],
+            'test_top5': eval_res['top5'],
+            'epoch_time_s': train_time,
+            'avg_infer_batch_s': eval_res['avg_batch_latency_s'],
+            'throughput_img_s': eval_res['throughput_img_per_s'],
+            'peak_gpu_mem_MB': peak_mem,
+            'lr': scheduler.get_last_lr()[0]
+        }
+        history.append(record)
+        print(f"[{model_name}] Epoch {ep:02d}: top1={record['test_top1']:.2f}%  loss={record['test_loss']:.4f}  "
+              f"time/ep={train_time:.1f}s  thr={record['throughput_img_s']:.1f} img/s  peak_mem={peak_mem:.0f}MB")
+
+    total_time = time.time()-t0
+    meta = {
+        'model': model_name,
+        'params': params,
+        'params_thop': params_thop,
+        'FLOPs_thop': flops,
+        'total_train_time_s': total_time,
+        'best_top1': best_top1
+    }
+    return history, meta
+
+# -------------------------
+# Runner: pick dataset & models, save CSV + plots
+# -------------------------
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def run_experiment(
+    dataset='cifar10',
+    models=('logistic','lenet','alexnet','resnet18','hilovit'),
+    epochs=10,
+    batch_size=128,
+    aug='standard',
+    img_size=32,
+    outdir='./exp_outputs'
+):
+    os.makedirs(outdir, exist_ok=True)
+    train_loader, test_loader, num_classes = get_cifar_loaders(dataset, img_size, batch_size)
+    all_rows = []
+    for mname in models:
+        if   mname=='logistic':  model = LogisticRegressionNet(num_classes)
+        elif mname=='lenet':     model = LeNetSmall(num_classes)
+        elif mname=='alexnet':   model = AlexNet32(num_classes)
+        elif mname=='resnet18':  model = get_resnet18(num_classes)
+        elif mname=='hilovit':   model = HiLoViT(img_size=img_size, num_classes=num_classes,
+                                                 embed_dim=192, depth=6, num_heads=6, window_size=2, alpha=0.5)
+        else: raise ValueError(mname)
+
+        print(f"\n==== {mname.upper()} ====")
+        print(torchinfo_summary(model, input_size=(1,3,img_size,img_size), verbose=0))
+        hist, meta = train_one(model, train_loader, test_loader,
+                               epochs=epochs, lr=3e-4 if mname!='logistic' else 1e-3,
+                               weight_decay=1e-4 if mname!='logistic' else 0.0,
+                               mix_precision=True, num_classes=num_classes,
+                               logdir=os.path.join(outdir,'runs'), model_name=mname)
+        # Save per-epoch history
+        df = pd.DataFrame(hist)
+        df['model'] = mname
+        df.to_csv(os.path.join(outdir, f'history_{dataset}_{mname}.csv'), index=False)
+        all_rows.append({**meta, 'dataset': dataset})
+
+        # Plot curves
+        plt.figure()
+        plt.plot(df['epoch'], df['test_top1']); plt.xlabel('Epoch'); plt.ylabel('Top-1 (%)'); plt.title(f'{mname} {dataset}')
+        plt.grid(True); plt.tight_layout()
+        plt.savefig(os.path.join(outdir, f'curve_top1_{dataset}_{mname}.png')); plt.close()
+
+        plt.figure()
+        plt.plot(df['epoch'], df['test_loss']); plt.xlabel('Epoch'); plt.ylabel('Test Loss'); plt.title(f'{mname} {dataset}')
+        plt.grid(True); plt.tight_layout()
+        plt.savefig(os.path.join(outdir, f'curve_loss_{dataset}_{mname}.png')); plt.close()
+
+    # Summary CSV
+    summ = pd.DataFrame(all_rows)
+    cols = ['dataset','model','best_top1','params','FLOPs_thop','total_train_time_s']
+    extra = [c for c in summ.columns if c not in cols]
+    summ = summ[cols+extra]
+    summ.to_csv(os.path.join(outdir, f'summary_{dataset}.csv'), index=False)
+    print("\n=== Summary ===")
+    display(summ)
+    print(f"Outputs saved to: {outdir}")
+    return summ
+
+# =========================
+# RUN: choose your setup here
+# =========================
+# Quick sanity run (few epochs). For real comparison, bump epochs to 50~200 (ResNet/ViT).
+summary_df = run_experiment(
+    dataset='cifar10',                         # 'cifar10' or 'cifar100'
+    models=('logistic','lenet','alexnet','resnet18','hilovit'),
+    epochs=10,                                 # increase for stronger results
+    batch_size=128,
+    aug='standard',
+    img_size=32,
+    outdir='./exp_outputs'
+)
+
