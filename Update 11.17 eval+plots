@@ -1,0 +1,149 @@
+# ===== Visualization: compare Logistic, LeNet, AlexNet, basic Transformer, basic ViT =====
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------
+# Load per-epoch histories for each model
+# ------------------------------------------------------------------
+history_paths = {
+    'logistic':   './exp_outputs_Tiger/history_cifar10_logistic.csv',
+    'lenet':      './exp_outputs_Tiger/history_cifar10_lenet.csv',
+    'alexnet':    './exp_outputs_Lizzy/history_cifar10_alexnet.csv',
+    'vit_msa':    './exp_outputs_Lizzy/history_cifar10_vit_msa.csv',     # basic transformer
+    'vit_vanilla':'./exp_outputs_Lizzy/history_cifar10_vit_vanilla.csv'  # basic ViT
+}
+
+histories = {}
+for name, path in history_paths.items():
+    if os.path.exists(path):
+        histories[name] = pd.read_csv(path)
+    else:
+        print(f"Warning: missing history file for {name}: {path}")
+
+# ------------------------------------------------------------------
+# Load summary metrics CSVs and merge them
+# ------------------------------------------------------------------
+summary_files = [
+    './exp_outputs_Tiger/summary_cifar10_Tiger.csv',
+    './exp_outputs_Lizzy/summary_cifar10_Lizzy.csv'
+]
+
+summary_list = []
+for path in summary_files:
+    if os.path.exists(path):
+        summary_list.append(pd.read_csv(path))
+    else:
+        print(f"Warning: missing summary file: {path}")
+
+summary_df = pd.concat(summary_list, ignore_index=True)
+summary_df = summary_df[summary_df['model'].isin(history_paths.keys())].copy()
+summary_df = summary_df.set_index('model').loc[list(history_paths.keys())]  # keep consistent order
+print(summary_df)
+
+# ------------------------------------------------------------------
+# Plot 1: Test accuracy vs. epoch for all models (convergence comparison)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+for name, df in histories.items():
+    plt.plot(df['epoch'], df['test_top1'], marker='o', label=name)
+plt.xlabel('Epoch')
+plt.ylabel('Test Top-1 Accuracy (%)')
+plt.title('Test Accuracy vs. Epoch (Logistic, LeNet, AlexNet, Transformer, ViT)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 2: Test loss vs. epoch for all models (loss convergence)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+for name, df in histories.items():
+    plt.plot(df['epoch'], df['test_loss'], marker='o', label=name)
+plt.xlabel('Epoch')
+plt.ylabel('Test Loss')
+plt.title('Test Loss vs. Epoch (Logistic, LeNet, AlexNet, Transformer, ViT)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 3: Bar chart of best accuracy by model (final performance)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+models = summary_df.index.tolist()
+accs = summary_df['best_top1'].values
+plt.bar(models, accs)
+plt.ylabel('Best Test Top-1 Accuracy (%)')
+plt.title('Best Accuracy by Model')
+plt.xticks(rotation=30)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 4: Bar chart of total training time by model (compute cost)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+times = summary_df['total_train_time_s'].values
+plt.bar(models, times)
+plt.ylabel('Total Training Time (s)')
+plt.title('Total Training Time by Model')
+plt.xticks(rotation=30)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 5: Bar chart of parameter count by model (model size, log scale)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+params = summary_df['params'].values
+plt.bar(models, params)
+plt.yscale('log')
+plt.ylabel('Number of Parameters (log scale)')
+plt.title('Model Size (Params) by Model')
+plt.xticks(rotation=30)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 6: Scatter plot of FLOPs vs. best accuracy (efficiency vs performance)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7,5))
+flops = summary_df['FLOPs_thop'].values
+plt.scatter(flops, accs)
+for i, m in enumerate(models):
+    plt.text(flops[i], accs[i], m, fontsize=9, ha='right', va='bottom')
+plt.xlabel('FLOPs (thop)')
+plt.ylabel('Best Test Top-1 Accuracy (%)')
+plt.title('FLOPs vs. Accuracy')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------
+# Plot 7: Bar chart of training throughput by model (images / second)
+# ------------------------------------------------------------------
+if 'train_throughput_img_s' in summary_df.columns:
+    plt.figure(figsize=(7,5))
+    thr_train = summary_df['train_throughput_img_s'].values
+    plt.bar(models, thr_train)
+    plt.ylabel('Training Throughput (images / second)')
+    plt.title('Training Throughput by Model')
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------------
+# Plot 8: Bar chart of peak GPU memory by model (memory footprint)
+# ------------------------------------------------------------------
+if 'peak_gpu_mem_MB' in summary_df.columns:
+    plt.figure(figsize=(7,5))
+    mem = summary_df['peak_gpu_mem_MB'].values
+    plt.bar(models, mem)
+    plt.ylabel('Peak GPU Memory (MB)')
+    plt.title('Peak GPU Memory by Model')
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
