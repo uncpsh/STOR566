@@ -1,0 +1,349 @@
+# ===== STOR566 | Shawn run: ResNet18 + HiLoViT (CIFAR-10, 2 epochs) =====
+# Setup
+!pip -q install thop timm
+!git clone -q https://github.com/ziplab/LITv2.git
+
+import sys
+sys.path.append('/content/LITv2')
+from hilo import HiLo  # official HiLo attention
+
+import os, time, random, numpy as np, pandas as pd
+import torch, torch.nn as nn
+import torchvision, torchvision.transforms as T
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from thop import profile
+from google.colab import files
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ------------------------------------------------------------------
+# Seed
+# ------------------------------------------------------------------
+def set_seed(s=2025):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.benchmark = True
+
+set_seed(2025)
+
+# ------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------
+def get_cifar_loaders(dataset='cifar10', img_size=32, batch_size=128, num_workers=2):
+    norm = T.Normalize((0.4914, 0.4822, 0.4465),
+                       (0.2470, 0.2435, 0.2616))
+    train_tf = T.Compose([
+        T.RandomCrop(img_size, padding=4),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+        norm
+    ])
+    test_tf = T.Compose([
+        T.ToTensor(),
+        norm
+    ])
+    train_ds = torchvision.datasets.CIFAR10(
+        './data', train=True, download=True, transform=train_tf
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        './data', train=False, download=True, transform=test_tf
+    )
+    tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                    num_workers=num_workers, pin_memory=True)
+    te = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, pin_memory=True)
+    return tr, te, 10
+
+# ------------------------------------------------------------------
+# Models
+# ------------------------------------------------------------------
+def get_resnet18(num_classes=10):
+    m = torchvision.models.resnet18(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, num_classes)
+    return m
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=32, patch_size=4,
+                 in_ch=3, embed_dim=192):
+        super().__init__()
+        self.proj = nn.Conv2d(in_ch, embed_dim,
+                              kernel_size=patch_size,
+                              stride=patch_size)
+        self.grid = img_size // patch_size
+    def forward(self, x):
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)  # (B, N, C)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, dim, mlp_ratio=4.0, drop=0.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(drop)
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class HiLoBlock(nn.Module):
+    def __init__(self, dim, num_heads=6,
+                 window_size=2, alpha=0.5,
+                 drop=0.0, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = HiLo(dim, num_heads, window_size, alpha)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, drop)
+        self.drop_path = nn.Identity()
+    def forward(self, x, H, W):
+        x = x + self.drop_path(self.attn(self.norm1(x), H, W))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+class HiLoViT(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, num_classes=10,
+                 embed_dim=192, depth=6, num_heads=6,
+                 window_size=2, alpha=0.5):
+        super().__init__()
+        self.patch = PatchEmbed(img_size, patch_size, 3, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos = nn.Parameter(
+            torch.zeros(1, (img_size // patch_size) ** 2 + 1, embed_dim)
+        )
+        self.blocks = nn.ModuleList([
+            HiLoBlock(embed_dim, num_heads,
+                      window_size, alpha)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+        self.grid = img_size // patch_size
+
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.patch(x)                       # (B, N, C)
+        cls = self.cls_token.expand(B, -1, -1)  # (B, 1, C)
+        x = torch.cat([cls, x], dim=1) + self.pos
+        for blk in self.blocks:
+            x = blk(x, self.grid, self.grid)
+        x = self.norm(x)
+        cls_out = x[:, 0]
+        return self.head(cls_out)
+
+# ------------------------------------------------------------------
+# Metrics helpers
+# ------------------------------------------------------------------
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+def get_flops(model, input_size=(1, 3, 32, 32)):
+    m = model.to('cpu').eval()
+    x = torch.randn(*input_size)
+    try:
+        flops, _ = profile(m, inputs=(x,), verbose=False)
+    except Exception:
+        flops = -1
+    return int(flops)
+
+@torch.no_grad()
+def eval_with_timing(model, loader, criterion):
+    model.eval()
+    total = 0
+    correct = 0
+    loss_sum = 0.0
+    times = []
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.time()
+        with autocast(enabled=(device.type == 'cuda')):
+            logits = model(x)
+            loss = criterion(logits, y)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        times.append(time.time() - t0)
+
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+        loss_sum += loss.item() * y.size(0)
+
+    avg_batch = float(np.mean(times)) if times else float('nan')
+    thr = (loader.batch_size / avg_batch) if avg_batch > 0 else float('nan')
+
+    return {
+        'loss': loss_sum / total,
+        'top1': 100.0 * correct / total,
+        'avg_infer_batch_s': avg_batch,
+        'throughput_img_s': thr,
+    }
+
+# ------------------------------------------------------------------
+# Training with rich metrics
+# ------------------------------------------------------------------
+def train_with_metrics(model, train_loader, test_loader,
+                       *, epochs, lr, wd, name, outdir):
+    os.makedirs(outdir, exist_ok=True)
+
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = GradScaler(enabled=(device.type == 'cuda'))
+    crit = nn.CrossEntropyLoss().to(device)
+
+    flops = get_flops(model)
+    model.to(device)  # move back after FLOPs
+    params = count_params(model)
+
+    hist = []
+    t0 = time.time()
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+
+    num_train_imgs = len(train_loader.dataset)
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        run_loss = 0.0
+        n = 0
+        ep0 = time.time()
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            with autocast(enabled=(device.type == 'cuda')):
+                logits = model(x)
+                loss = crit(logits, y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            run_loss += loss.item() * y.size(0)
+            n += y.size(0)
+
+        sch.step()
+        eval_res = eval_with_timing(model, test_loader, crit)
+        ep_time = time.time() - ep0
+        peak = (torch.cuda.max_memory_allocated() / 1024**2
+                if device.type == 'cuda' else float('nan'))
+
+        row = {
+            'epoch': ep,
+            'train_loss': run_loss / n,
+            'test_loss': eval_res['loss'],
+            'test_top1': eval_res['top1'],
+            'avg_infer_batch_s': eval_res['avg_infer_batch_s'],
+            'throughput_img_s': eval_res['throughput_img_s'],
+            'epoch_time_s': ep_time,
+            'peak_gpu_mem_MB': peak,
+            'lr': sch.get_last_lr()[0],
+        }
+        hist.append(row)
+
+        print(f"[{name}] ep{ep:02d} "
+              f"top1={row['test_top1']:.2f}% "
+              f"loss={row['test_loss']:.4f} "
+              f"time/ep={ep_time:.1f}s "
+              f"thr={row['throughput_img_s']:.1f}/s")
+
+    total_train = time.time() - t0
+    hist_df = pd.DataFrame(hist)
+    hist_path = os.path.join(outdir, f'history_cifar10_{name}.csv')
+    hist_df.to_csv(hist_path, index=False)
+
+    # ----- aggregate metrics for summary CSV -----
+    tops = hist_df['test_top1'].to_numpy()
+    train_losses = hist_df['train_loss'].to_numpy()
+    test_losses = hist_df['test_loss'].to_numpy()
+    epoch_times = hist_df['epoch_time_s'].to_numpy()
+    cum_times = np.cumsum(epoch_times)
+
+    best_top1 = float(tops.max())
+    best_idx = int(tops.argmax())
+    epoch_of_best = int(hist_df.iloc[best_idx]['epoch'])
+
+    # time to 50% and 90% of best accuracy
+    t50 = float('nan')
+    t90 = float('nan')
+    for i, acc in enumerate(tops):
+        if np.isnan(t50) and acc >= 0.5 * best_top1:
+            t50 = float(cum_times[i])
+        if np.isnan(t90) and acc >= 0.9 * best_top1:
+            t90 = float(cum_times[i])
+
+    avg_epoch_time = float(epoch_times.mean())
+    train_throughput = (num_train_imgs / avg_epoch_time
+                        if avg_epoch_time > 0 else float('nan'))
+    peak_gpu_mem = float(np.nanmax(hist_df['peak_gpu_mem_MB'].to_numpy()))
+
+    summary = {
+        'model': name,
+        'best_top1': best_top1,
+        'epoch_of_best_top1': epoch_of_best,
+        'train_loss_first_epoch': float(train_losses[0]),
+        'train_loss_last_epoch': float(train_losses[-1]),
+        'test_loss_first_epoch': float(test_losses[0]),
+        'test_loss_last_epoch': float(test_losses[-1]),
+        'std_train_loss': float(train_losses.std()),
+        'std_test_top1': float(tops.std()),
+        'params': params,
+        'FLOPs_thop': flops,
+        'avg_epoch_time_s': avg_epoch_time,
+        'total_train_time_s': float(total_train),
+        'time_to_50pct_of_best_s': float(t50),
+        'time_to_90pct_of_best_s': float(t90),
+        'train_throughput_img_s': float(train_throughput),
+        'avg_infer_batch_s': float(hist_df.iloc[-1]['avg_infer_batch_s']),
+        'infer_throughput_img_s': float(hist_df.iloc[-1]['throughput_img_s']),
+        'peak_gpu_mem_MB': peak_gpu_mem,
+        'final_lr': float(hist_df.iloc[-1]['lr']),
+    }
+    return summary
+
+# ------------------------------------------------------------------
+# Run experiment: ResNet18 vs HiLoViT
+# ------------------------------------------------------------------
+train_loader, test_loader, ncls = get_cifar_loaders('cifar10', 32, 128)
+outdir = './exp_outputs_Shawn'
+os.makedirs(outdir, exist_ok=True)
+
+summaries = []
+
+summaries.append(
+    train_with_metrics(
+        get_resnet18(ncls),
+        train_loader, test_loader,
+        epochs=2, lr=3e-4, wd=1e-4,
+        name='resnet18', outdir=outdir)
+)
+
+summaries.append(
+    train_with_metrics(
+        HiLoViT(img_size=32, num_classes=ncls,
+                embed_dim=192, depth=6,
+                num_heads=6, window_size=2, alpha=0.5),
+        train_loader, test_loader,
+        epochs=2, lr=3e-4, wd=1e-4,
+        name='hilovit', outdir=outdir)
+)
+
+summary_path = os.path.join(outdir, 'summary_cifar10_Shawn.csv')
+pd.DataFrame(summaries).to_csv(summary_path, index=False)
+print("Saved summary ->", summary_path)
+
+# Download summary CSV to local machine
+files.download(summary_path)
