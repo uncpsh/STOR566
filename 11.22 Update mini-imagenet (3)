@@ -692,7 +692,7 @@ def main():
             depth=6,
             num_heads=6,
             window_size=2,
-            alpha=0.5,
+            alpha=0.9,
             mlp_ratio=4.0,
             drop=0.0,
         ),
