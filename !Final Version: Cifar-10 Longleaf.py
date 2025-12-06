@@ -1,5 +1,4 @@
-# ===== STOR566 Final: HiLoViT vs Transformer vs ViT vs ResNet18 (CIFAR-10) =====
-# Single file: train all models + summary table + plots (saved as PNGs)
+# HiLoViT vs Transformer vs ViT vs ResNet18 (CIFAR-10)
 
 import os
 import time
