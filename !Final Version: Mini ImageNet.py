@@ -1,5 +1,4 @@
-# ===== STOR566 Final: HiLoViT vs Transformer vs ViT vs ResNet18 (Mini-ImageNet) =====
-# Dataset: mini-ImageNet (84x84), 4 models, same metrics, same tables/plots as CIFAR script
+# HiLoViT vs Transformer vs ViT vs ResNet18 (Mini-ImageNet 84x84)
 
 import os
 import time
